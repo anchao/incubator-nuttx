@@ -95,6 +95,46 @@
  ****************************************************************************/
 
 /****************************************************************************
+ * Name: tcp_inqueue_wrb_size
+ *
+ * Description:
+ *   Get the in-queued write buffer size from connection
+ *
+ * Input Parameters:
+ *   conn - The TCP connection of interest
+ *
+ * Assumptions:
+ *   Called from user logic with the network locked.
+ *
+ ****************************************************************************/
+
+#if CONFIG_NET_SEND_BUFSIZE > 0
+static uint32_t tcp_inqueue_wrb_size(FAR struct tcp_conn_s *conn)
+{
+  FAR struct tcp_wrbuffer_s *wrb;
+  FAR sq_entry_t *entry;
+  uint32_t total = 0;
+
+  if (conn)
+    {
+      for (entry = sq_peek(&conn->unacked_q); entry; entry = sq_next(entry))
+        {
+          wrb = (FAR struct tcp_wrbuffer_s *)entry;
+          total += TCP_WBPKTLEN(wrb);
+        }
+
+      for (entry = sq_peek(&conn->write_q); entry; entry = sq_next(entry))
+        {
+          wrb = (FAR struct tcp_wrbuffer_s *)entry;
+          total += TCP_WBPKTLEN(wrb);
+        }
+    }
+
+  return total;
+}
+#endif /* CONFIG_NET_SEND_BUFSIZE */
+
+/****************************************************************************
  * Name: psock_insert_segment
  *
  * Description:
@@ -220,6 +260,12 @@ static inline void psock_lost_connection(FAR struct socket *psock,
           tcp_wrbuffer_release((FAR struct tcp_wrbuffer_s *)entry);
         }
 
+#if CONFIG_NET_SEND_BUFSIZE > 0
+      /* Notify the send buffer available */
+
+      tcp_sendbuffer_notify(conn);
+#endif /* CONFIG_NET_SEND_BUFSIZE */
+
       /* Reset write buffering variables */
 
       sq_init(&conn->unacked_q);
@@ -312,6 +358,9 @@ static uint16_t psock_send_eventhandler(FAR struct net_driver_s *dev,
   FAR struct tcp_conn_s *conn = (FAR struct tcp_conn_s *)pvconn;
   FAR struct socket *psock = (FAR struct socket *)pvpriv;
   bool rexmit = false;
+#if CONFIG_NET_SEND_BUFSIZE > 0
+  uint32_t inqueue;
+#endif /* CONFIG_NET_SEND_BUFSIZE */
 
   /* Check for a loss of connection */
 
@@ -348,6 +397,10 @@ static uint16_t psock_send_eventhandler(FAR struct net_driver_s *dev,
     }
 
   ninfo("flags: %04x\n", flags);
+
+#if CONFIG_NET_SEND_BUFSIZE > 0
+  inqueue = tcp_inqueue_wrb_size(conn);
+#endif /* CONFIG_NET_SEND_BUFSIZE */
 
   /* If this packet contains an acknowledgment, then update the count of
    * acknowledged bytes.
@@ -703,6 +756,15 @@ static uint16_t psock_send_eventhandler(FAR struct net_driver_s *dev,
         }
     }
 
+#if CONFIG_NET_SEND_BUFSIZE > 0
+  /* Notify the send buffer available if wrbbuffer drained */
+
+  if (inqueue > tcp_inqueue_wrb_size(conn))
+    {
+      tcp_sendbuffer_notify(conn);
+    }
+#endif /* CONFIG_NET_SEND_BUFSIZE */
+
   /* Check if the outgoing packet is available (it may have been claimed
    * by a sendto event serving a different thread).
    */
@@ -899,44 +961,6 @@ static uint32_t tcp_max_wrb_size(FAR struct tcp_conn_s *conn)
 }
 
 /****************************************************************************
- * Name: tcp_inqueue_wrb_size
- *
- * Description:
- *   Get the in-queued write buffer size from connection
- *
- * Input Parameters:
- *   conn - The TCP connection of interest
- *
- * Assumptions:
- *   Called from user logic with the network locked.
- *
- ****************************************************************************/
-
-static uint32_t tcp_inqueue_wrb_size(FAR struct tcp_conn_s *conn)
-{
-  FAR struct tcp_wrbuffer_s *wrb;
-  FAR sq_entry_t *entry;
-  uint32_t total = 0;
-
-  if (conn)
-    {
-      for (entry = sq_peek(&conn->unacked_q); entry; entry = sq_next(entry))
-        {
-          wrb = (FAR struct tcp_wrbuffer_s *)entry;
-          total += TCP_WBPKTLEN(wrb);
-        }
-
-      for (entry = sq_peek(&conn->write_q); entry; entry = sq_next(entry))
-        {
-          wrb = (FAR struct tcp_wrbuffer_s *)entry;
-          total += TCP_WBPKTLEN(wrb);
-        }
-    }
-
-  return total;
-}
-
-/****************************************************************************
  * Public Functions
  ****************************************************************************/
 
@@ -1097,6 +1121,23 @@ ssize_t psock_tcp_send(FAR struct socket *psock, FAR const void *buf,
                                TCP_DISCONN_EVENTS);
       psock->s_sndcb->priv  = (FAR void *)psock;
       psock->s_sndcb->event = psock_send_eventhandler;
+
+#if CONFIG_NET_SEND_BUFSIZE > 0
+      /* If the send buffer size exceeds the send limit,
+       * wait for the write buffer to be released
+       */
+
+      while (tcp_inqueue_wrb_size(conn) >= conn->snd_bufs)
+        {
+          if (nonblock)
+            {
+              ret = -EAGAIN;
+              goto errout_with_lock;
+            }
+
+          net_lockedwait_uninterruptible(&conn->snd_sem);
+        }
+#endif /* CONFIG_NET_SEND_BUFSIZE */
 
       /* Allocate a write buffer.  Careful, the network will be momentarily
        * unlocked here.
@@ -1354,5 +1395,32 @@ int psock_tcp_cansend(FAR struct socket *psock)
 
   return OK;
 }
+
+/****************************************************************************
+ * Name: tcp_sendbuffer_notify
+ *
+ * Description:
+ *   Notify the send buffer semaphore
+ *
+ * Input Parameters:
+ *   conn - The TCP connection of interest
+ *
+ * Assumptions:
+ *   Called from user logic with the network locked.
+ *
+ ****************************************************************************/
+
+#if CONFIG_NET_SEND_BUFSIZE > 0
+void tcp_sendbuffer_notify(FAR struct tcp_conn_s *conn)
+{
+  int val = 0;
+
+  nxsem_get_value(&conn->snd_sem, &val);
+  if (val < 0)
+    {
+      nxsem_post(&conn->snd_sem);
+    }
+}
+#endif /* CONFIG_NET_SEND_BUFSIZE */
 
 #endif /* CONFIG_NET && CONFIG_NET_TCP && CONFIG_NET_TCP_WRITE_BUFFERS */
